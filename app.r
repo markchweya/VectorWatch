@@ -1,17 +1,13 @@
-# app.R — VectorWatch (Weekly Extracts)
-# Login
+# app.R — VectorWatch (Smart loader: weekly OR monthly extracts)
+# Login:
 #   user  / user123
 #   admin / admin123
 #
-# Setup (Windows)
-# 1) Download + unzip: vectorwatch_weekly_synthetic_datasets.zip
-# 2) Create this folder:
-#      C:/Users/HP/Downloads/vectorwatch_weekly_synthetic/
-# 3) Put the unzipped contents inside it so you end up with:
-#      Downloads/vectorwatch_weekly_synthetic/high/...
-#      Downloads/vectorwatch_weekly_synthetic/medium/...
-#      Downloads/vectorwatch_weekly_synthetic/low/...
-#      Downloads/vectorwatch_weekly_synthetic/README.txt
+# What this app does:
+# - You point it to a folder that contains:
+#     high/ , medium/ , low/
+# - It AUTO-detects whether the files are WEEKLY (W01..W52) or MONTHLY (01..12)
+# - So you don't need to paste every CSV path (just ONE base folder path).
 
 install_if_missing <- function(pkgs){
   miss <- pkgs[!pkgs %in% rownames(installed.packages())]
@@ -36,16 +32,12 @@ library(plotly)
 library(digest)
 library(lubridate)
 
-# -------- Favicon: mosquito emoji (no assets) --------
 favicon_data_uri <- function(emoji = "🦟"){
-  svg <- paste0(
-    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>",
-    "<text y='.9em' font-size='90'>", emoji, "</text></svg>"
-  )
+  svg <- paste0("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>",
+                "<text y='.9em' font-size='90'>", emoji, "</text></svg>")
   paste0("data:image/svg+xml,", URLencode(svg, reserved = TRUE))
 }
 
-# -------- Basic security: store hashes, not raw passwords --------
 hash_pw <- function(x) digest(x, algo = "sha256")
 ACCOUNTS <- data.frame(
   user = c("user","admin"),
@@ -54,19 +46,19 @@ ACCOUNTS <- data.frame(
   stringsAsFactors = FALSE
 )
 
-# -------- Default data folder (Downloads/vectorwatch_weekly_synthetic) --------
 default_data_dir <- function(){
   dl <- file.path(Sys.getenv("USERPROFILE"), "Downloads")
-  normalizePath(file.path(dl, "vectorwatch_weekly_synthetic"), winslash = "/", mustWork = FALSE)
+  # Try weekly first, then monthly
+  p1 <- file.path(dl, "vectorwatch_weekly_synthetic")
+  p2 <- file.path(dl, "vectorwatch_synthetic")
+  if (dir.exists(p1)) return(normalizePath(p1, winslash="/", mustWork=FALSE))
+  normalizePath(p2, winslash="/", mustWork=FALSE)
 }
 
-# -------- Kenya counties boundary (Admin level 1) --------
-# Using GADM via {geodata}. First run may download the boundary.
 get_kenya_adm1 <- function(){
   tryCatch({
     adm <- geodata::gadm("KEN", level = 1, path = tempdir())
     kenya_sf <- sf::st_as_sf(adm) |> sf::st_make_valid()
-
     name_col <- intersect(names(kenya_sf), c("NAME_1","shapeName","name"))[1]
     kenya_sf |>
       rename(county = all_of(name_col)) |>
@@ -74,25 +66,45 @@ get_kenya_adm1 <- function(){
   }, error = function(e) NULL)
 }
 
-# -------- Read weekly CSVs (only weeks the user selects) --------
-read_weeks <- function(data_dir, coverage, weeks){
-  stopifnot(coverage %in% c("high","medium","low"))
+detect_mode <- function(data_dir, coverage){
   folder <- file.path(data_dir, coverage)
+  if(!dir.exists(folder)) return(list(mode="none", hint="Coverage folder missing."))
 
-  files <- file.path(folder, sprintf("vectorwatch_malaria_2024_W%02d_%s.csv", weeks, coverage))
-  files <- files[file.exists(files)]
+  f <- list.files(folder, full.names = FALSE)
 
-  if(length(files) == 0) return(NULL)
+  weekly_pat <- "^vectorwatch_malaria_2024_W\\d{2}_.+\\.csv$"
+  monthly_pat <- "^vectorwatch_malaria_2024_\\d{2}_.+\\.csv$"
 
-  # keep it simple: read + bind
-  df <- do.call(rbind, lapply(files, function(f) read.csv(f, stringsAsFactors = FALSE)))
+  has_weekly <- any(grepl(weekly_pat, f, ignore.case = TRUE))
+  has_monthly <- any(grepl(monthly_pat, f, ignore.case = TRUE)) && !has_weekly
 
-  df |>
-    clean_names() |>
-    mutate(date = as.Date(date))
+  if(has_weekly) return(list(mode="weekly", hint="Detected weekly extracts (W01..W52)."))
+  if(has_monthly) return(list(mode="monthly", hint="Detected monthly extracts (01..12)."))
+
+  list(mode="none", hint="No matching VectorWatch CSVs found in this coverage folder.")
 }
 
-# -------- Patient-level -> county summaries (what we map) --------
+read_data <- function(data_dir, coverage, mode, time_vals){
+  folder <- file.path(data_dir, coverage)
+
+  if (mode == "weekly") {
+    files <- file.path(folder, sprintf("vectorwatch_malaria_2024_W%02d_%s.csv", time_vals, coverage))
+  } else {
+    files <- file.path(folder, sprintf("vectorwatch_malaria_2024_%02d_%s.csv", time_vals, coverage))
+  }
+  files <- files[file.exists(files)]
+  if(length(files) == 0) return(NULL)
+
+  df <- do.call(rbind, lapply(files, function(f) read.csv(f, stringsAsFactors = FALSE)))
+  df <- df |> clean_names() |> mutate(date = as.Date(date))
+
+  # If monthly files: add iso_week for trend charts
+  if(!"iso_week" %in% names(df)){
+    df <- df |> mutate(iso_week = isoweek(date))
+  }
+  df
+}
+
 make_county_summary <- function(df){
   df |>
     group_by(county) |>
@@ -108,10 +120,8 @@ make_county_summary <- function(df){
     arrange(desc(prevalence))
 }
 
-# -------- ESDA on polygons (Moran + LISA) --------
 esda_on_polygons <- function(kenya_joined){
   km <- kenya_joined |> filter(!is.na(prevalence))
-
   nb <- spdep::poly2nb(km, queen = TRUE)
   lw <- spdep::nb2listw(nb, style = "W", zero.policy = TRUE)
 
@@ -131,10 +141,9 @@ esda_on_polygons <- function(kenya_joined){
   km$cluster[sig & z > 0 & lag_z < 0] <- "High-Low"
   km$cluster[sig & z < 0 & lag_z > 0] <- "Low-High"
 
-  list(km = km, lw = lw, moran = mor)
+  list(km = km, moran = mor)
 }
 
-# -------- theme --------
 theme_vw <- bs_theme(
   version = 5,
   bootswatch = "darkly",
@@ -204,33 +213,14 @@ ui <- fluidPage(
         background: linear-gradient(135deg, var(--teal), var(--blue)) !important;
         border: none !important;
       }
-      .nav-tabs .nav-link{
-        border-radius: 999px !important;
-        margin-right: .35rem;
-        border: 1px solid rgba(255,255,255,.10) !important;
-        background: rgba(255,255,255,.04);
-      }
-      .nav-tabs .nav-link.active{
-        background: rgba(56,230,214,.12) !important;
-        border-color: rgba(56,230,214,.35) !important;
-      }
-    ")),
-    tags$script(HTML("
-      document.addEventListener('mousemove', (e) => {
-        const x = (e.clientX / window.innerWidth - 0.5) * 6;
-        const y = (e.clientY / window.innerHeight - 0.5) * 6;
-        const el = document.querySelector('.vw-topbar');
-        if(el) el.style.transform = `translate3d(${x/10}px, ${y/12}px, 0)`;
-      });
     "))
   ),
-
   div(class="vw-topbar",
       div(class="vw-brand",
           div(class="vw-dot"),
           div(
             div(class="vw-title", "VectorWatch"),
-            div(class="vw-tag", "Weekly malaria surveillance • Hotspots • Early signal • Targeted action")
+            div(class="vw-tag", "Malaria surveillance • Hotspots • Early signal • Targeted action")
           ),
           div(style="margin-left:auto;display:flex;gap:.5rem;align-items:center;padding-right:1rem;",
               uiOutput("whoami_ui"),
@@ -238,7 +228,6 @@ ui <- fluidPage(
           )
       )
   ),
-
   uiOutput("main_ui")
 )
 
@@ -254,6 +243,12 @@ server <- function(input, output, session){
 
   observe({ rv$kenya_sf <- get_kenya_adm1() })
 
+  output$whoami_ui <- renderUI({
+    if (!isTRUE(rv$authed)) return(span(style="opacity:.75;", "Not signed in"))
+    span(style="opacity:.85;font-size:.95rem;",
+         paste0("Signed in: ", rv$user, "  •  ", rv$role))
+  })
+
   login_ui <- function(){
     fluidRow(
       column(12,
@@ -263,7 +258,7 @@ server <- function(input, output, session){
               span(style="font-size: 1.25rem; font-weight: 800;", "Secure Access")
           ),
           div(style="color: rgba(255,255,255,.70); margin-bottom: 1rem;",
-              "Sign in to access weekly hotspot intelligence and operational planning tools."
+              "Sign in to access malaria hotspot intelligence dashboards."
           ),
           textInput("login_user", "Username", placeholder = "user"),
           passwordInput("login_pass", "Password", placeholder = "••••••••"),
@@ -284,20 +279,14 @@ server <- function(input, output, session){
         div(class="vw-card tilt vw-fadein",
           h5("Dataset location"),
           textInput("data_dir", NULL, value = rv$data_dir),
-          div(style="color: rgba(255,255,255,.65); font-size:.92rem; margin-top:.35rem;",
-              "Should point to: Downloads/vectorwatch_weekly_synthetic"),
+          uiOutput("mode_hint"),
           tags$hr(style="border-color: rgba(255,255,255,.10);"),
 
           h5("Coverage"),
           selectInput("coverage", NULL, choices = c("high","medium","low"), selected = "high"),
           tags$hr(style="border-color: rgba(255,255,255,.10);"),
 
-          h5("ISO weeks (2024)"),
-          selectizeInput("weeks", NULL,
-                         choices = 1:52,
-                         selected = c(10,11,12,13,14,15),  # a small default window
-                         multiple = TRUE,
-                         options = list(placeholder = "Select weeks")),
+          uiOutput("time_selector"),
           tags$hr(style="border-color: rgba(255,255,255,.10);"),
 
           h5("Filters"),
@@ -305,77 +294,34 @@ server <- function(input, output, session){
           selectInput("cluster_filter", "Show clusters", choices = c("All","High-High","Low-Low","High-Low","Low-High","Not significant"), selected = "All"),
           tags$hr(style="border-color: rgba(255,255,255,.10);"),
 
-          h5("Exports"),
           downloadButton("dl_hotspots", "Download hotspot table (CSV)", class="btn btn-outline-light")
         )
       ),
 
       column(9,
         div(class="vw-card glow vw-fadein",
-          tabsetPanel(
-            type = "tabs",
-            tabPanel("Command Center",
-              br(),
-              fluidRow(
-                column(3, div(class="vw-card tilt", uiOutput("kpi_tests"))),
-                column(3, div(class="vw-card tilt", uiOutput("kpi_pos"))),
-                column(3, div(class="vw-card tilt", uiOutput("kpi_hotspots"))),
-                column(3, div(class="vw-card tilt", uiOutput("kpi_moran")))
-              ),
-              br(),
-              fluidRow(
-                column(7,
-                  div(class="vw-card tilt",
-                    h5("Prevalence Map"),
-                    leafletOutput("map", height = 420)
-                  )
-                ),
-                column(5,
-                  div(class="vw-card tilt",
-                    h5("Priority Queue"),
-                    uiOutput("data_status"),
-                    tableOutput("priority_table")
-                  )
-                )
-              )
-            ),
-            tabPanel("Hotspots (LISA)",
-              br(),
-              fluidRow(
-                column(6, div(class="vw-card tilt", h5("LISA Cluster Map"), leafletOutput("map_lisa", height = 460))),
-                column(6, div(class="vw-card tilt", h5("Hotspot List (significant only)"), tableOutput("hotspot_table")))
-              )
-            ),
-            tabPanel("Weekly trend (selected weeks)",
-              br(),
-              div(class="vw-card tilt",
-                  h5("Positivity by week"),
-                  div(style="color: rgba(255,255,255,.70); margin-bottom:.6rem;",
-                      "Because data is weekly extracts, this trend is literally week-by-week."),
-                  selectInput("trend_county", "Pick a county", choices = character(0)),
-                  plotlyOutput("trend_plot", height = 420)
-              )
-            ),
-            tabPanel("3D Insights",
-              br(),
-              div(class="vw-card tilt",
-                h5("3D County Profile"),
-                div(style="color: rgba(255,255,255,.70); margin-bottom:.6rem;",
-                    "X = mean age, Y = mean hemoglobin, Z = prevalence (%)."),
-                plotlyOutput("plot3d", height = 520)
-              )
-            )
-          )
+          fluidRow(
+            column(3, div(class="vw-card tilt", uiOutput("kpi_tests"))),
+            column(3, div(class="vw-card tilt", uiOutput("kpi_pos"))),
+            column(3, div(class="vw-card tilt", uiOutput("kpi_hotspots"))),
+            column(3, div(class="vw-card tilt", uiOutput("kpi_moran")))
+          ),
+          br(),
+          fluidRow(
+            column(7, div(class="vw-card tilt", h5("Prevalence Map"), leafletOutput("map", height = 420))),
+            column(5, div(class="vw-card tilt", h5("Priority Queue"), uiOutput("data_status"), tableOutput("priority_table")))
+          ),
+          br(),
+          fluidRow(
+            column(6, div(class="vw-card tilt", h5("LISA Cluster Map"), leafletOutput("map_lisa", height = 420))),
+            column(6, div(class="vw-card tilt", h5("Weekly trend"), selectInput("trend_county", "County", choices = character(0)), plotlyOutput("trend_plot", height = 360)))
+          ),
+          br(),
+          div(class="vw-card tilt", h5("3D County Profile"), plotlyOutput("plot3d", height = 520))
         )
       )
     )
   }
-
-  output$whoami_ui <- renderUI({
-    if (!isTRUE(rv$authed)) return(span(style="opacity:.75;", "Not signed in"))
-    span(style="opacity:.85;font-size:.95rem;",
-         paste0("Signed in: ", rv$user, "  •  ", rv$role))
-  })
 
   output$main_ui <- renderUI({
     if (!isTRUE(rv$authed)) login_ui() else app_ui()
@@ -417,37 +363,66 @@ server <- function(input, output, session){
 
   observeEvent(input$data_dir, { rv$data_dir <- input$data_dir }, ignoreInit = TRUE)
 
+  mode_info <- reactive({
+    req(rv$authed)
+    req(input$coverage)
+    detect_mode(rv$data_dir, input$coverage)
+  })
+
+  output$mode_hint <- renderUI({
+    mi <- mode_info()
+    div(style="color: rgba(255,255,255,.70); font-size:.92rem; margin-top:.4rem;",
+        paste0("Auto-detect: ", mi$hint))
+  })
+
+  output$time_selector <- renderUI({
+    mi <- mode_info()
+    if(mi$mode == "weekly"){
+      tagList(
+        h5("ISO weeks (2024)"),
+        selectizeInput("time_vals", NULL,
+          choices = 1:52, selected = c(10,11,12,13,14,15), multiple = TRUE)
+      )
+    } else {
+      tagList(
+        h5("Months (2024)"),
+        selectizeInput("time_vals", NULL,
+          choices = 1:12, selected = c(3,4,5), multiple = TRUE)
+      )
+    }
+  })
+
   df_raw <- reactive({
     req(rv$authed)
-    req(input$weeks)
-    req(input$coverage)
+    mi <- mode_info()
+    req(input$time_vals)
 
-    df <- read_weeks(rv$data_dir, input$coverage, as.integer(input$weeks))
-    validate(need(!is.null(df),
-      paste0("No files found. Expected something like:\n",
-             rv$data_dir, "/", input$coverage, "/vectorwatch_malaria_2024_W10_", input$coverage, ".csv\n\n",
-             "Fix: unzip the dataset into Downloads/vectorwatch_weekly_synthetic, or update the path in the left panel.")
+    validate(need(mi$mode != "none",
+      paste0("No files detected. Make sure your folder contains high/medium/low with VectorWatch CSVs.\n\n",
+             "Example weekly filename: vectorwatch_malaria_2024_W10_high.csv\n",
+             "Example monthly filename: vectorwatch_malaria_2024_03_high.csv")
     ))
 
+    df <- read_data(rv$data_dir, input$coverage, mi$mode, as.integer(input$time_vals))
+    validate(need(!is.null(df),
+      "No matching files for your selected time range. Try selecting a different week/month, or check your folder."
+    ))
     df
   })
 
   county_summary <- reactive({
-    df_raw() |>
-      make_county_summary() |>
-      filter(n_tests >= input$min_n)
+    df_raw() |> make_county_summary() |> filter(n_tests >= input$min_n)
   })
 
   output$data_status <- renderUI({
-    dir_ok <- dir.exists(rv$data_dir)
+    mi <- mode_info()
     div(style="margin:.4rem 0 0; padding:.55rem .7rem; border-radius: 14px;
               border:1px solid rgba(56,230,214,.25); background: rgba(56,230,214,.08);
               color: rgba(255,255,255,.82);",
-        strong("Using: "),
-        paste0(ifelse(dir_ok, "✅ ", "⚠️ "), rv$data_dir),
+        strong("Using: "), rv$data_dir,
         br(),
         span(style="opacity:.85;",
-             paste0("Coverage: ", input$coverage, " • Weeks: ", paste(input$weeks, collapse = ", ")))
+             paste0("Coverage: ", input$coverage, " • Mode: ", mi$mode, " • Selected: ", paste(input$time_vals, collapse=", ")))
     )
   })
 
@@ -459,21 +434,20 @@ server <- function(input, output, session){
 
   output$kpi_tests <- renderUI({
     df <- df_raw()
-    div(class="vw-metric", div(class="k", "Records loaded"),
+    div(class="vw-metric", div(class="k","Records loaded"),
         div(class="v", format(nrow(df), big.mark=",")))
   })
 
   output$kpi_pos <- renderUI({
     df <- df_raw()
     rate <- mean(df$parasite_detected == 1, na.rm = TRUE)
-    div(class="vw-metric", div(class="k", "Positivity rate"),
-        div(class="v", paste0(round(100*rate, 1), "%")))
+    div(class="vw-metric", div(class="k","Positivity rate"),
+        div(class="v", paste0(round(100*rate,1), "%")))
   })
 
   kenya_joined <- reactive({
     req(rv$kenya_sf)
-    rv$kenya_sf |>
-      left_join(county_summary(), by = "county")
+    rv$kenya_sf |> left_join(county_summary(), by="county")
   })
 
   esda <- reactive({
@@ -483,21 +457,19 @@ server <- function(input, output, session){
 
   output$kpi_hotspots <- renderUI({
     hh <- sum(esda()$km$cluster == "High-High", na.rm = TRUE)
-    div(class="vw-metric", div(class="k", "High–High hotspots"), div(class="v", hh))
+    div(class="vw-metric", div(class="k","High–High hotspots"), div(class="v", hh))
   })
 
   output$kpi_moran <- renderUI({
     mor <- esda()$moran
     I  <- unname(mor$estimate[["Moran I statistic"]])
     p  <- mor$p.value
-    div(class="vw-metric",
-        div(class="k", "Global Moran’s I (p-value)"),
-        div(class="v", paste0(round(I, 3), " (", signif(p, 3), ")")))
+    div(class="vw-metric", div(class="k","Global Moran’s I (p-value)"),
+        div(class="v", paste0(round(I,3), " (", signif(p,3), ")")))
   })
 
   output$priority_table <- renderTable({
     km <- esda()$km |> st_drop_geometry()
-
     if (input$cluster_filter != "All") km <- km |> filter(cluster == input$cluster_filter)
 
     km |>
@@ -511,20 +483,10 @@ server <- function(input, output, session){
       arrange(priority, desc(prevalence)) |>
       select(county, cluster, n_tests, prevalence, p_Ii) |>
       head(10)
-  }, striped = TRUE, digits = 3)
-
-  output$hotspot_table <- renderTable({
-    esda()$km |>
-      st_drop_geometry() |>
-      filter(p_Ii <= 0.05, cluster != "Not significant") |>
-      arrange(factor(cluster, levels=c("High-High","High-Low","Low-High","Low-Low")),
-              desc(prevalence)) |>
-      select(county, cluster, n_tests, prevalence, Ii, p_Ii) |>
-      head(25)
-  }, striped = TRUE, digits = 3)
+  }, striped=TRUE, digits=3)
 
   pal_prev <- reactive({
-    colorNumeric("viridis", domain = county_summary()$prevalence, na.color = "transparent")
+    colorNumeric("viridis", domain = county_summary()$prevalence, na.color="transparent")
   })
 
   output$map <- renderLeaflet({
@@ -535,60 +497,52 @@ server <- function(input, output, session){
     leaflet(km) |>
       addProviderTiles("CartoDB.DarkMatter") |>
       addPolygons(
-        color = "rgba(255,255,255,.14)", weight = 1, opacity = 1,
-        fillColor = ~pal(prevalence), fillOpacity = 0.75,
-        label = ~paste0(
-          "<b>", county, "</b><br/>",
-          "Tests: ", ifelse(is.na(n_tests), "—", n_tests), "<br/>",
-          "Prevalence: ", ifelse(is.na(prevalence), "—", round(prevalence,1)), "%"
-        ) |> lapply(HTML),
-        highlightOptions = highlightOptions(weight = 2, color = "#38E6D6", fillOpacity = 0.9, bringToFront = TRUE)
+        color="rgba(255,255,255,.14)", weight=1, opacity=1,
+        fillColor=~pal(prevalence), fillOpacity=0.75,
+        label=~paste0("<b>", county, "</b><br/>Tests: ", ifelse(is.na(n_tests),"—",n_tests),
+                      "<br/>Prevalence: ", ifelse(is.na(prevalence),"—",round(prevalence,1)),"%") |> lapply(HTML),
+        highlightOptions=highlightOptions(weight=2, color="#38E6D6", fillOpacity=0.9, bringToFront=TRUE)
       ) |>
-      addLegend("bottomright", pal = pal, values = ~prevalence, title = "Prevalence (%)", opacity = 1)
+      addLegend("bottomright", pal=pal, values=~prevalence, title="Prevalence (%)", opacity=1)
   })
 
   output$map_lisa <- renderLeaflet({
     km <- esda()$km
-
     lisa_pal <- colorFactor(
-      palette = c("High-High"="#FF6B6B","Low-Low"="#4DFFB5","High-Low"="#FFC857","Low-High"="#7AA7FF","Not significant"="rgba(255,255,255,.10)"),
-      domain = c("High-High","Low-Low","High-Low","Low-High","Not significant")
+      palette=c("High-High"="#FF6B6B","Low-Low"="#4DFFB5","High-Low"="#FFC857","Low-High"="#7AA7FF","Not significant"="rgba(255,255,255,.10)"),
+      domain=c("High-High","Low-Low","High-Low","Low-High","Not significant")
     )
-
     leaflet(km) |>
       addProviderTiles("CartoDB.DarkMatter") |>
       addPolygons(
-        color = "rgba(255,255,255,.14)", weight = 1, opacity = 1,
-        fillColor = ~lisa_pal(cluster), fillOpacity = 0.78,
-        label = ~paste0(
-          "<b>", county, "</b><br/>",
-          "Cluster: ", cluster, "<br/>",
-          "Prev: ", ifelse(is.na(prevalence), "—", round(prevalence,1)), "%<br/>",
-          "p: ", ifelse(is.na(p_Ii), "—", signif(p_Ii, 3))
-        ) |> lapply(HTML),
-        highlightOptions = highlightOptions(weight = 2, color = "#38E6D6", fillOpacity = 0.9, bringToFront = TRUE)
+        color="rgba(255,255,255,.14)", weight=1, opacity=1,
+        fillColor=~lisa_pal(cluster), fillOpacity=0.78,
+        label=~paste0("<b>", county, "</b><br/>Cluster: ", cluster,
+                      "<br/>Prev: ", ifelse(is.na(prevalence),"—",round(prevalence,1)),"%<br/>p: ",
+                      ifelse(is.na(p_Ii),"—",signif(p_Ii,3))) |> lapply(HTML),
+        highlightOptions=highlightOptions(weight=2, color="#38E6D6", fillOpacity=0.9, bringToFront=TRUE)
       ) |>
-      addLegend("bottomright", pal = lisa_pal, values = ~cluster, title = "LISA cluster", opacity = 1)
+      addLegend("bottomright", pal=lisa_pal, values=~cluster, title="LISA cluster", opacity=1)
   })
 
   output$trend_plot <- renderPlotly({
     req(input$trend_county)
+    df <- df_raw() |> filter(county == input$trend_county)
 
-    wk <- df_raw() |>
-      filter(county == input$trend_county) |>
+    wk <- df |>
       group_by(iso_week) |>
       summarise(
         tests = n(),
         cases = sum(parasite_detected == 1, na.rm = TRUE),
         positivity = 100 * cases / tests,
-        .groups = "drop"
+        .groups="drop"
       ) |>
       arrange(iso_week)
 
-    plot_ly(wk, x = ~iso_week, y = ~positivity, type = "scatter", mode = "lines+markers",
-            hovertemplate = paste("Week: %{x}<br>Positivity: %{y:.1f}%<extra></extra>")) |>
-      layout(yaxis = list(title = "Positivity (%)"), xaxis = list(title = "ISO Week"),
-             margin = list(l=40, r=10, b=40, t=10))
+    plot_ly(wk, x=~iso_week, y=~positivity, type="scatter", mode="lines+markers",
+            hovertemplate="Week: %{x}<br>Positivity: %{y:.1f}%<extra></extra>") |>
+      layout(yaxis=list(title="Positivity (%)"), xaxis=list(title="ISO Week"),
+             margin=list(l=40,r=10,b=40,t=10))
   })
 
   output$plot3d <- renderPlotly({
@@ -596,25 +550,20 @@ server <- function(input, output, session){
       filter(!is.na(mean_age), !is.na(mean_hb), !is.na(prevalence))
 
     plot_ly(
-      data = km,
-      x = ~mean_age, y = ~mean_hb, z = ~prevalence,
-      type = "scatter3d", mode = "markers",
-      color = ~cluster,
-      marker = list(size = 4, opacity = 0.85),
-      text = ~paste0("County: ", county,
-                     "<br>Prev: ", round(prevalence,1), "%",
-                     "<br>Tests: ", n_tests,
-                     "<br>Cluster: ", cluster),
-      hoverinfo = "text"
+      data=km,
+      x=~mean_age, y=~mean_hb, z=~prevalence,
+      type="scatter3d", mode="markers",
+      color=~cluster,
+      marker=list(size=4, opacity=0.85),
+      text=~paste0("County: ", county, "<br>Prev: ", round(prevalence,1), "%<br>Tests: ", n_tests, "<br>Cluster: ", cluster),
+      hoverinfo="text"
     ) |>
-      layout(
-        scene = list(
-          xaxis = list(title = "Mean age"),
-          yaxis = list(title = "Mean Hb (g/dL)"),
-          zaxis = list(title = "Prevalence (%)")
-        ),
-        margin = list(l=0, r=0, b=0, t=0)
-      )
+      layout(scene=list(
+        xaxis=list(title="Mean age"),
+        yaxis=list(title="Mean Hb (g/dL)"),
+        zaxis=list(title="Prevalence (%)")
+      ),
+      margin=list(l=0,r=0,b=0,t=0))
   })
 
   output$dl_hotspots <- downloadHandler(
@@ -626,7 +575,7 @@ server <- function(input, output, session){
         arrange(factor(cluster, levels=c("High-High","High-Low","Low-High","Low-Low","Not significant")),
                 desc(prevalence)) |>
         select(county, cluster, n_tests, malaria_cases, prevalence, Ii, p_Ii)
-      write.csv(out, file, row.names = FALSE)
+      write.csv(out, file, row.names=FALSE)
     }
   )
 }
