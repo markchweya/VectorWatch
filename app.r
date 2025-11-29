@@ -1,31 +1,31 @@
-# app.R — VectorWatch v2 (fixed ESDA + glass UI + collapsible sidebar + folder picker)
-# Login:
+# VectorWatch — single-file Shiny app (fixed + clean)
+# -----------------------------------------------------
+# IMPORTANT: This is R code.
+# Do NOT paste any Python wrapper (e.g., "from pathlib import Path") into RStudio.
+#
+# Run like this:
+#   shiny::runApp("C:/Users/HP/OneDrive/Documents/School Work/Statistical Modeling")
+#
+# Demo logins:
 #   user  / user123
 #   admin / admin123
-#
-# You DO NOT paste 52 CSV paths.
-# You point the app to ONE base folder that contains:
-#   high/   medium/   low/
-# And files inside like:
-#   vectorwatch_malaria_2024_W10_high.csv   OR   vectorwatch_malaria_2024_03_high.csv
-#
-# This v2 fixes:
-# - "Error: non-positive number of entities" (was caused by county name mismatch / empty map data)
-# - Map not coloring / LISA not showing
-# - 3D plot failing
-# - White chart backgrounds (now transparent, glass glow)
-# - Sidebar can collapse (desktop) / become slide-over (mobile)
-# - Folder picker (browse) so user can select the dataset folder
 
-install_if_missing <- function(pkgs){
-  miss <- pkgs[!pkgs %in% rownames(installed.packages())]
-  if(length(miss)) install.packages(miss, dependencies = TRUE)
+needed <- c(
+  "shiny","bslib","htmltools","dplyr","janitor","stringr","lubridate",
+  "digest","leaflet","plotly","shinyFiles","shinyjs",
+  "sf","spdep","geodata"
+)
+missing <- needed[!vapply(needed, requireNamespace, FUN.VALUE = logical(1), quietly = TRUE)]
+if(length(missing)){
+  stop(
+    paste0(
+      "Missing packages: ", paste(missing, collapse = ", "), "\n\n",
+      "Install once (in Console), then re-run:\n",
+      "install.packages(c(", paste(sprintf('"%s"', missing), collapse = ", "), "), dependencies=TRUE)\n"
+    ),
+    call. = FALSE
+  )
 }
-
-pkgs <- c("shiny","bslib","htmltools","dplyr","janitor","stringr",
-          "sf","spdep","leaflet","plotly","digest","lubridate",
-          "geodata","terra","shinyFiles")
-install_if_missing(pkgs)
 
 library(shiny)
 library(bslib)
@@ -33,21 +33,23 @@ library(htmltools)
 library(dplyr)
 library(janitor)
 library(stringr)
-library(sf)
-library(spdep)
+library(lubridate)
+library(digest)
 library(leaflet)
 library(plotly)
-library(digest)
-library(lubridate)
 library(shinyFiles)
+library(shinyjs)
+library(sf)
+library(spdep)
+library(geodata)
 
-favicon_data_uri <- function(emoji = "🦟"){
-  svg <- paste0("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>",
-                "<text y='.9em' font-size='90'>", emoji, "</text></svg>")
-  paste0("data:image/svg+xml,", URLencode(svg, reserved = TRUE))
-}
+`%||%` <- function(x, y) if (is.null(x) || length(x) == 0 || identical(x, "")) y else x
+
+# (Fix for your earlier crash: runjs must come from shinyjs)
+runjs <- shinyjs::runjs
 
 hash_pw <- function(x) digest(x, algo = "sha256")
+
 ACCOUNTS <- data.frame(
   user = c("user","admin"),
   pass_hash = c(hash_pw("user123"), hash_pw("admin123")),
@@ -55,12 +57,12 @@ ACCOUNTS <- data.frame(
   stringsAsFactors = FALSE
 )
 
-default_data_dir <- function(){
-  dl <- file.path(Sys.getenv("USERPROFILE"), "Downloads")
-  p_week <- file.path(dl, "vectorwatch_weekly_synthetic")
-  p_mon  <- file.path(dl, "vectorwatch_synthetic")
-  if (dir.exists(p_week)) return(normalizePath(p_week, winslash = "/", mustWork = FALSE))
-  normalizePath(p_mon, winslash = "/", mustWork = FALSE)
+favicon_data_uri <- function(emoji = "🦟"){
+  svg <- paste0(
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>",
+    "<text y='.9em' font-size='90'>", emoji, "</text></svg>"
+  )
+  paste0("data:image/svg+xml,", URLencode(svg, reserved = TRUE))
 }
 
 norm_county <- function(x){
@@ -75,69 +77,101 @@ get_kenya_adm1 <- function(){
   tryCatch({
     adm <- geodata::gadm("KEN", level = 1, path = tempdir())
     kenya_sf <- sf::st_as_sf(adm) |> sf::st_make_valid()
-    name_col <- intersect(names(kenya_sf), c("NAME_1","shapeName","name"))[1]
+
+    name_col <- intersect(names(kenya_sf), c("NAME_1","shapeName","name","VARNAME_1"))[1]
+    if(is.na(name_col) || is.null(name_col)) return(NULL)
+
     kenya_sf |>
       rename(county = all_of(name_col)) |>
       mutate(
-        county = str_squish(as.character(county)),
+        county = as.character(county),
         county_key = norm_county(county)
       )
   }, error = function(e) NULL)
 }
 
-detect_mode <- function(data_dir, coverage){
-  folder <- file.path(data_dir, coverage)
+detect_mode <- function(base_dir, coverage){
+  folder <- file.path(base_dir, coverage)
   if(!dir.exists(folder)) return(list(mode="none", hint="Coverage folder missing."))
 
   f <- list.files(folder, full.names = FALSE)
-
   weekly_pat  <- "^vectorwatch_malaria_2024_W\\d{2}_.+\\.csv$"
   monthly_pat <- "^vectorwatch_malaria_2024_\\d{2}_.+\\.csv$"
 
-  has_weekly  <- any(grepl(weekly_pat, f, ignore.case = TRUE))
+  has_weekly  <- any(grepl(weekly_pat,  f, ignore.case = TRUE))
   has_monthly <- any(grepl(monthly_pat, f, ignore.case = TRUE)) && !has_weekly
 
-  if(has_weekly) return(list(mode="weekly", hint="Detected weekly extracts (W01..W52)."))
-  if(has_monthly) return(list(mode="monthly", hint="Detected monthly extracts (01..12)."))
-
-  list(mode="none", hint="No matching VectorWatch CSVs found in this coverage folder.")
+  if(has_weekly)  return(list(mode="weekly",  hint="Weekly extracts detected (W01..W52)."))
+  if(has_monthly) return(list(mode="monthly", hint="Monthly extracts detected (01..12)."))
+  list(mode="none", hint="No VectorWatch CSVs detected in this coverage folder.")
 }
 
-read_data <- function(data_dir, coverage, mode, time_vals){
-  folder <- file.path(data_dir, coverage)
+coerce_schema <- function(df){
+  df <- df |> clean_names()
 
-  files <- if (mode == "weekly"){
+  if(!("county" %in% names(df))) df$county <- NA_character_
+  if(!("date" %in% names(df))) df$date <- NA
+
+  if(!("parasite_detected" %in% names(df))){
+    cand <- intersect(names(df), c("positive","pos","result","malaria_positive"))
+    if(length(cand)) df$parasite_detected <- as.integer(df[[cand[1]]])
+    else df$parasite_detected <- 0L
+  }
+
+  if(!("age" %in% names(df))){
+    cand <- intersect(names(df), c("age_years","years"))
+    if(length(cand)) df$age <- suppressWarnings(as.numeric(df[[cand[1]]]))
+    else df$age <- NA_real_
+  }
+
+  if(!("hemoglobin_g_dl" %in% names(df))){
+    cand <- intersect(names(df), c("hb","hgb","hemoglobin"))
+    if(length(cand)) df$hemoglobin_g_dl <- suppressWarnings(as.numeric(df[[cand[1]]]))
+    else df$hemoglobin_g_dl <- NA_real_
+  }
+
+  if(!("wbc_cells_ul" %in% names(df))){
+    cand <- intersect(names(df), c("wbc","wbc_ul","white_blood_cells"))
+    if(length(cand)) df$wbc_cells_ul <- suppressWarnings(as.numeric(df[[cand[1]]]))
+    else df$wbc_cells_ul <- NA_real_
+  }
+
+  df |>
+    mutate(
+      county = as.character(county),
+      county_key = norm_county(county),
+      date = suppressWarnings(as.Date(date)),
+      parasite_detected = as.integer(parasite_detected),
+      iso_week = as.integer(ifelse(!is.na(date), lubridate::isoweek(date), NA))
+    )
+}
+
+read_data <- function(base_dir, coverage, mode, time_vals){
+  folder <- file.path(base_dir, coverage)
+
+  files <- if(mode == "weekly"){
     file.path(folder, sprintf("vectorwatch_malaria_2024_W%02d_%s.csv", time_vals, coverage))
   } else {
     file.path(folder, sprintf("vectorwatch_malaria_2024_%02d_%s.csv", time_vals, coverage))
   }
 
   files <- files[file.exists(files)]
-  if(length(files) == 0) return(NULL)
+  if(!length(files)) return(NULL)
 
   df <- do.call(rbind, lapply(files, function(f) read.csv(f, stringsAsFactors = FALSE)))
-  df <- df |>
-    clean_names() |>
-    mutate(
-      date = as.Date(date),
-      county_key = norm_county(county),
-      iso_week = ifelse("iso_week" %in% names(.),
-                        as.integer(iso_week),
-                        as.integer(lubridate::isoweek(date)))
-    )
-
-  df
+  coerce_schema(df)
 }
 
 make_county_summary <- function(df){
   df |>
+    filter(!is.na(county_key), county_key != "") |>
     group_by(county_key) |>
     summarise(
       n_tests = n(),
       malaria_cases = sum(parasite_detected == 1, na.rm = TRUE),
       prevalence = 100 * malaria_cases / n_tests,
       mean_age = mean(age, na.rm = TRUE),
-      mean_hb  = mean(hemoglobin_g_dl, na.rm = TRUE),
+      mean_hb = mean(hemoglobin_g_dl, na.rm = TRUE),
       mean_wbc = mean(wbc_cells_ul, na.rm = TRUE),
       .groups = "drop"
     ) |>
@@ -146,30 +180,25 @@ make_county_summary <- function(df){
 
 esda_on_polygons <- function(kenya_joined){
   km <- kenya_joined |> filter(!is.na(prevalence))
-
   if(nrow(km) < 3){
-    return(list(ok = FALSE, msg = "Not enough counties left for ESDA. Lower 'Minimum tests', or select more weeks/months.", km = km))
+    return(list(ok=FALSE, msg="Not enough counties for ESDA. Select more time slices or lower minimum tests.", km=km))
   }
 
   nb <- spdep::poly2nb(km, queen = TRUE)
   if(length(nb) == 0){
-    return(list(ok = FALSE, msg = "Neighbour list is empty (polygons issue).", km = km))
+    return(list(ok=FALSE, msg="Neighbour list is empty (topology issue).", km=km))
   }
 
   lw <- spdep::nb2listw(nb, style = "W", zero.policy = TRUE)
-
-  mor <- tryCatch(spdep::moran.test(km$prevalence, listw = lw, zero.policy = TRUE),
-                  error = function(e) NULL)
-
-  lisa <- tryCatch(spdep::localmoran(km$prevalence, lw, zero.policy = TRUE),
-                   error = function(e) NULL)
+  mor <- tryCatch(spdep::moran.test(km$prevalence, listw = lw, zero.policy = TRUE), error=function(e) NULL)
+  lisa <- tryCatch(spdep::localmoran(km$prevalence, lw, zero.policy = TRUE), error=function(e) NULL)
 
   if(is.null(mor) || is.null(lisa)){
-    return(list(ok = FALSE, msg = "ESDA failed to compute (try selecting more weeks/months).", km = km))
+    return(list(ok=FALSE, msg="ESDA couldn't compute. Add more time slices.", km=km))
   }
 
-  km$Ii   <- lisa[, 1]
-  km$p_Ii <- lisa[, 5]
+  km$Ii <- lisa[,1]
+  km$p_Ii <- lisa[,5]
 
   z <- as.numeric(scale(km$prevalence))
   lag_z <- spdep::lag.listw(lw, z, zero.policy = TRUE)
@@ -181,7 +210,7 @@ esda_on_polygons <- function(kenya_joined){
   km$cluster[sig & z > 0 & lag_z < 0] <- "High-Low"
   km$cluster[sig & z < 0 & lag_z > 0] <- "Low-High"
 
-  list(ok = TRUE, km = km, moran = mor)
+  list(ok=TRUE, km=km, moran=mor)
 }
 
 theme_vw <- bs_theme(
@@ -193,431 +222,401 @@ theme_vw <- bs_theme(
 
 ui <- fluidPage(
   theme = theme_vw,
+  shinyjs::useShinyjs(),
   tags$head(
-    tags$link(rel = "icon", href = favicon_data_uri("🦟")),
+    tags$link(rel="icon", href = favicon_data_uri("🦟")),
     tags$meta(name="viewport", content="width=device-width, initial-scale=1"),
     tags$style(HTML("
-      :root{
-        --bg0:#050A14; --bg1:#070D1D;
-        --glass: rgba(255,255,255,.06);
-        --stroke: rgba(255,255,255,.10);
-        --muted: rgba(255,255,255,.66);
-        --text: rgba(255,255,255,.92);
-        --teal: #4AF2D6; --blue: #4C78FF; --violet:#B56CFF; --amber:#FFC857;
-        --shadow: 0 14px 40px rgba(0,0,0,.35);
-        --r: 20px;
-      }
-
-      html, body { height: 100%; }
+      :root{--glass:rgba(255,255,255,.06);--stroke:rgba(255,255,255,.10);--r:22px;--shadow:0 14px 40px rgba(0,0,0,.35);}
+      html,body{height:100%;}
       body{
-        overflow: hidden;
         background:
           radial-gradient(1200px 650px at 12% 8%, rgba(76,120,255,.18), transparent 55%),
           radial-gradient(900px 520px at 86% 22%, rgba(74,242,214,.14), transparent 55%),
           radial-gradient(1000px 540px at 60% 100%, rgba(181,108,255,.10), transparent 65%),
-          linear-gradient(180deg, var(--bg0), var(--bg1));
+          linear-gradient(180deg, #050A14, #070D1D);
       }
+      .vw-card{border:1px solid var(--stroke);background:var(--glass);border-radius:var(--r);box-shadow:var(--shadow);}
+      .vw-pad{padding:1rem;}
+      .vw-ghost{background:rgba(255,255,255,.06)!important;border:1px solid rgba(255,255,255,.14)!important;color:#fff!important;border-radius:999px!important;}
+      .btn-primary{border:none!important;border-radius:999px!important;background:linear-gradient(135deg, rgba(74,242,214,.95), rgba(76,120,255,.95))!important;}
 
-      .vw-wrap{ height: 100vh; display: flex; flex-direction: column; }
-      .vw-topbar{
-        height: 64px; display: flex; align-items: center; gap: .9rem; padding: 0 1rem;
-        border-bottom: 1px solid var(--stroke);
-        backdrop-filter: blur(14px);
-        background: rgba(5,10,20,.62);
+      .vw-landing{height:100vh; overflow:hidden; position:relative;}
+      .vw-sky{position:absolute; inset:0; pointer-events:none; z-index:1;}
+      .vw-moz{position:absolute; font-size:14px; opacity:.92;}
+      .vw-laser{position:absolute; height:2px; background:linear-gradient(90deg, rgba(74,242,214,0), rgba(74,242,214,.95), rgba(76,120,255,.95)); opacity:0;}
+      .vw-zap{position:absolute; width:26px; height:26px; border-radius:999px; border:1px solid rgba(74,242,214,.55); opacity:0;}
+
+      .vw-topbar{height:64px;display:flex;align-items:center;gap:.9rem;padding:0 1rem;border-bottom:1px solid rgba(255,255,255,.10);backdrop-filter:blur(14px);background:rgba(5,10,20,.62);}
+      .vw-dot{width:10px;height:10px;border-radius:999px;background:linear-gradient(135deg,#4AF2D6,#4C78FF);}
+      .vw-wrap{height:100vh;display:flex;flex-direction:column;overflow:hidden;}
+      .vw-shell{flex:1;display:flex;min-height:0;}
+      .vw-sidebar{width:340px;padding:1rem;border-right:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.03);backdrop-filter:blur(14px);overflow:auto;}
+      .vw-main{flex:1;min-width:0;padding:1rem;overflow:auto;}
+      .vw-collapsed .vw-sidebar{width:0!important;padding:0!important;opacity:0;transform:translateX(-10px);border-right:none;}
+
+      .tabbable > .nav-pills > li > a{border-radius:999px!important;}
+      .selectize-control.single .selectize-input{border-radius:14px!important;}
+
+      @media(max-width:992px){
+        .vw-sidebar{position:fixed;top:64px;left:0;height:calc(100vh - 64px);width:min(88vw,380px);transform:translateX(-105%);transition:transform .26s ease;z-index:40;box-shadow:0 30px 80px rgba(0,0,0,.55);}
+        .vw-side-open .vw-sidebar{transform:translateX(0);}
+        .vw-scrim{position:fixed;inset:64px 0 0 0;background:rgba(0,0,0,.45);z-index:35;display:none;}
+        .vw-side-open .vw-scrim{display:block;}
       }
-      .vw-dot{
-        width: 10px; height: 10px; border-radius: 999px;
-        background: linear-gradient(135deg, var(--teal), var(--blue));
-        box-shadow: 0 0 18px rgba(74,242,214,.35);
-      }
-      .vw-brand h1{ font-size: 1.08rem; margin: 0; line-height: 1.1; font-weight: 800; }
-      .vw-brand .tag{ margin: 0; font-size: .9rem; color: var(--muted); }
-
-      .vw-shell{ flex: 1; display: flex; min-height: 0; }
-      .vw-sidebar{
-        width: 330px; padding: 1rem; border-right: 1px solid var(--stroke);
-        background: rgba(255,255,255,.03); backdrop-filter: blur(14px);
-        transition: transform .28s ease, width .28s ease, opacity .28s ease;
-      }
-      .vw-main{ flex: 1; min-width: 0; padding: 1rem; overflow: hidden; }
-
-      .vw-collapsed .vw-sidebar{ width: 0 !important; padding: 0 !important; opacity: 0; transform: translateX(-10px); border-right:none; }
-
-      @media (max-width: 992px){
-        body{ overflow: auto; }
-        .vw-shell{ flex-direction: column; }
-        .vw-sidebar{ width: 100%; border-right:none; border-bottom:1px solid var(--stroke); }
-        .vw-main{ overflow: visible; }
-      }
-
-      .vw-card{
-        border: 1px solid var(--stroke);
-        background: var(--glass);
-        border-radius: var(--r);
-        box-shadow: var(--shadow);
-      }
-      .vw-pad{ padding: 1rem; }
-
-      .vw-glow{ position: relative; overflow: hidden; }
-      .vw-glow:before{
-        content:''; position:absolute; inset:-1px; border-radius: var(--r); padding: 1px;
-        background: linear-gradient(135deg, rgba(74,242,214,.55), rgba(76,120,255,.55), rgba(181,108,255,.35));
-        -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-        -webkit-mask-composite: xor; mask-composite: exclude;
-        opacity: .55; pointer-events:none;
-      }
-      .vw-glow:hover:before{ opacity: .85; }
-
-      .vw-appear{ animation: vwIn .35s ease-out both; }
-      @keyframes vwIn { from { opacity:0; transform: translateY(6px);} to { opacity:1; transform: translateY(0);} }
-      .tab-pane{ animation: vwIn .28s ease-out both; }
-
-      .form-control, .selectize-input, .selectize-dropdown, .btn{ border-radius: 14px !important; }
-      .form-control, .selectize-input{
-        background: rgba(255,255,255,.06) !important;
-        border: 1px solid rgba(255,255,255,.12) !important;
-        color: var(--text) !important;
-      }
-      .selectize-dropdown{ background: rgba(10,14,26,.95) !important; border: 1px solid rgba(255,255,255,.12) !important; }
-      .selectize-dropdown .active{ background: rgba(74,242,214,.18) !important; }
-      label{ color: rgba(255,255,255,.72) !important; }
-
-      .nav-pills .nav-link{ border: 1px solid rgba(255,255,255,.10) !important; background: rgba(255,255,255,.04) !important; margin-right: .4rem; }
-      .nav-pills .nav-link.active{ background: rgba(74,242,214,.14) !important; border-color: rgba(74,242,214,.30) !important; }
-
-      .leaflet-control{ background: rgba(10,14,26,.72) !important; backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,.12) !important; color: rgba(255,255,255,.88) !important; border-radius: 14px !important; box-shadow: 0 12px 34px rgba(0,0,0,.35); }
-      .leaflet-control-attribution{ background: transparent !important; color: rgba(255,255,255,.45) !important; }
-
-      .vw-kpi .k{ color: var(--muted); font-size: .9rem; }
-      .vw-kpi .v{ font-size: 1.6rem; font-weight: 800; }
-      .vw-kpi .sub{ color: rgba(255,255,255,.55); font-size:.88rem; }
-
-      .vw-out{ border-radius: var(--r); overflow: hidden; }
-
-      .vw-ghost{ background: rgba(255,255,255,.06) !important; border: 1px solid rgba(255,255,255,.14) !important; color: rgba(255,255,255,.88) !important; }
-      .vw-danger{ color: #ff6b6b; font-weight: 700; }
-
-      .vw-scroll{ overflow: auto; max-height: calc(100vh - 64px - 2rem); }
-      .vw-scroll::-webkit-scrollbar{ width: 10px; height:10px;}
-      .vw-scroll::-webkit-scrollbar-thumb{ background: rgba(255,255,255,.12); border-radius: 99px;}
-      .vw-scroll::-webkit-scrollbar-track{ background: transparent;}
     ")),
     tags$script(HTML("
-      document.addEventListener('click', (e) => {
-        if(e.target && e.target.id === 'vwToggleSidebar'){
-          const root = document.getElementById('vwRoot');
-          if(root) root.classList.toggle('vw-collapsed');
-        }
+      function vwRand(min, max){ return Math.random() * (max - min) + min; }
+      function vwLaserZap(sky, x1,y1, x2,y2){
+        const dx=x2-x1, dy=y2-y1;
+        const len=Math.sqrt(dx*dx+dy*dy);
+        const ang=Math.atan2(dy,dx)*180/Math.PI;
+
+        const laser=document.createElement('div');
+        laser.className='vw-laser';
+        laser.style.left=x1+'px';
+        laser.style.top=y1+'px';
+        laser.style.width=len+'px';
+        laser.style.transform=`rotate(${ang}deg)`;
+        sky.appendChild(laser);
+
+        const zap=document.createElement('div');
+        zap.className='vw-zap';
+        zap.style.left=(x2-13)+'px';
+        zap.style.top=(y2-13)+'px';
+        sky.appendChild(zap);
+
+        laser.animate([{opacity:0},{opacity:1},{opacity:0}],{duration:220,easing:'ease-out'});
+        zap.animate([{opacity:0,transform:'scale(.6)'},{opacity:1,transform:'scale(1.15)'},{opacity:0,transform:'scale(1.8)'}],{duration:320,easing:'ease-out'});
+
+        setTimeout(()=>{laser.remove();zap.remove();},450);
+      }
+      function vwSpawnMoz(){
+        const sky=document.querySelector('.vw-sky');
+        if(!sky) return;
+        if(sky.querySelectorAll('.vw-moz').length > 6) return;
+
+        const w=window.innerWidth, h=window.innerHeight;
+        const moz=document.createElement('div');
+        moz.className='vw-moz';
+        moz.textContent='🦟';
+
+        const sx=vwRand(20,w-20), sy=vwRand(80,h-40);
+        moz.style.left=sx+'px'; moz.style.top=sy+'px';
+        sky.appendChild(moz);
+
+        const flyDur=vwRand(2600,5200);
+        moz.animate([{opacity:0},{opacity:.95},{opacity:.95},{opacity:0}],{duration:flyDur,easing:'ease-in-out'});
+
+        const zapAt=vwRand(900, flyDur-600);
+        setTimeout(()=>{
+          const r=moz.getBoundingClientRect();
+          const tx=r.left+r.width/2, ty=r.top+r.height/2;
+          const fromX=Math.random()<0.5 ? vwRand(0,60) : vwRand(w-60,w);
+          const fromY=vwRand(64,160);
+          vwLaserZap(sky, fromX, fromY, tx, ty);
+          moz.animate([{opacity:1},{opacity:0}],{duration:160,easing:'ease-out'});
+          setTimeout(()=>moz.remove(), 200);
+        }, zapAt);
+
+        setTimeout(()=>{ if(moz.isConnected) moz.remove(); }, flyDur+200);
+      }
+      let vwMozTimer=null;
+      function vwStartLanding(){
+        if(vwMozTimer) return;
+        vwMozTimer=setInterval(()=>{ if(document.querySelector('.vw-landing')) vwSpawnMoz(); }, vwRand(650,1200));
+      }
+      function vwStopLanding(){ if(vwMozTimer){ clearInterval(vwMozTimer); vwMozTimer=null; } }
+
+      function vwToggleSidebar(){
+        const root=document.getElementById('vwRoot');
+        if(!root) return;
+        const isMobile=window.matchMedia('(max-width: 992px)').matches;
+        if(isMobile) root.classList.toggle('vw-side-open');
+        else root.classList.toggle('vw-collapsed');
+      }
+      window.vwToggleSidebar=vwToggleSidebar;
+      function vwCloseSidebar(){
+        const root=document.getElementById('vwRoot');
+        if(root) root.classList.remove('vw-side-open');
+      }
+      window.vwCloseSidebar=vwCloseSidebar;
+
+      const obs=new MutationObserver(()=>{ if(document.querySelector('.vw-landing')) vwStartLanding(); else vwStopLanding(); });
+      window.addEventListener('load', ()=>{
+        obs.observe(document.body,{childList:true,subtree:true});
+        if(document.querySelector('.vw-landing')) vwStartLanding();
       });
     "))
   ),
-
-  div(id="vwRoot", class="vw-wrap",
-    div(class="vw-topbar",
-      div(class="vw-dot"),
-      div(class="vw-brand",
-        tags$h1("VectorWatch"),
-        tags$p(class="tag","Malaria surveillance • Hotspots • Early signal • Targeted action")
-      ),
-      div(style="margin-left:auto; display:flex; gap:.5rem; align-items:center;",
-        actionButton("toggleSidebarBtn","☰", class="vw-ghost", onclick="document.getElementById('vwToggleSidebar').click();"),
-        tags$button(id="vwToggleSidebar", type="button", style="display:none;", ""),
-        uiOutput("whoami_ui"),
-        actionButton("logout", "Logout", class="vw-ghost")
-      )
-    ),
-
-    div(class="vw-shell",
-      div(class="vw-sidebar vw-scroll", uiOutput("sidebar_ui")),
-      div(class="vw-main vw-scroll", uiOutput("main_ui"))
-    )
-  )
+  uiOutput("page")
 )
 
 server <- function(input, output, session){
 
-  rv <- reactiveValues(
-    authed = FALSE,
-    user = NULL,
-    role = NULL,
-    data_dir = default_data_dir(),
-    kenya_sf = NULL
-  )
-
-  volumes <- shinyFiles::getVolumes()()
-  shinyDirChoose(input, "dir", roots = volumes, session = session)
+  rv <- reactiveValues(step="landing", authed=FALSE, user=NULL, role=NULL, data_dir="", kenya_sf=NULL)
 
   observe({ rv$kenya_sf <- get_kenya_adm1() })
 
-  tries <- reactiveVal(0)
+  # folder picker
+  volumes <- shinyFiles::getVolumes()()
+  shinyDirChoose(input, "dir", roots = volumes, session = session)
 
-  output$whoami_ui <- renderUI({
-    if (!isTRUE(rv$authed)) return(span(style="opacity:.7;color:rgba(255,255,255,.75);", "Not signed in"))
-    span(style="opacity:.9;color:rgba(255,255,255,.85);",
-         paste0("Signed in: ", rv$user, " • ", rv$role))
-  })
-
-  login_ui <- function(){
-    div(class="vw-card vw-pad vw-glow vw-appear", style="max-width: 560px; margin: 4vh auto;",
-      tags$h3(style="margin:.1rem 0 .2rem;font-weight:900;", "Secure Access 🦟"),
-      tags$p(style="margin:0 0 1rem;color:rgba(255,255,255,.70);",
-             "Sign in to access hotspot intelligence and operational planning."),
-      textInput("login_user", "Username", placeholder = "user"),
-      passwordInput("login_pass", "Password", placeholder = "••••••••"),
-      div(style="display:flex; gap:.6rem; align-items:center;",
-          actionButton("login_btn", "Login", class="btn btn-primary"),
-          span(style="color:rgba(255,255,255,.55); font-size:.92rem;", "Demo: user/user123 • admin/admin123")
-      ),
-      uiOutput("login_msg")
+  landing_ui <- function(){
+    div(class="vw-landing",
+      div(class="vw-sky"),
+      div(style="position:absolute; inset:0; display:grid; place-items:center; padding:24px; z-index:2;",
+        div(style="width:min(980px,96vw); display:grid; grid-template-columns:1.15fr .85fr; gap:18px;",
+          div(class="vw-card vw-pad",
+            h1("VectorWatch"),
+            p("We fight malaria with early signal. Mosquitoes appear — then get zapped."),
+            div(style="display:flex; gap:10px; flex-wrap:wrap;",
+              actionButton("go_login","Go to App", class="btn-primary"),
+              actionButton("learn_more","What’s inside?", class="vw-ghost")
+            ),
+            div(style="margin-top:10px; opacity:.78;", "Demo login: user/user123 • admin/admin123")
+          ),
+          div(class="vw-card vw-pad",
+            h4("You’ll see"),
+            tags$ul(
+              tags$li("County prevalence heat map"),
+              tags$li("LISA hotspot clusters"),
+              tags$li("Trends + 3D profile")
+            )
+          )
+        )
+      )
     )
   }
+
+  login_ui <- function(){
+    div(class="vw-landing",
+      div(style="position:absolute; inset:0; display:grid; place-items:center; padding:24px; z-index:2;",
+        div(class="vw-card vw-pad", style="width:min(620px,92vw);",
+          h2("Secure Access"),
+          textInput("login_user","Username", placeholder="user"),
+          passwordInput("login_pass","Password", placeholder="••••••••"),
+          div(style="display:flex; gap:10px; flex-wrap:wrap;",
+            actionButton("login_btn","Login", class="btn-primary"),
+            actionButton("back_landing","Back", class="vw-ghost")
+          ),
+          uiOutput("login_msg")
+        )
+      )
+    )
+  }
+
+  app_ui <- function(){
+    div(id="vwRoot", class="vw-wrap",
+      div(class="vw-topbar",
+        div(class="vw-dot"),
+        div(style="display:flex; flex-direction:column;",
+          div(style="font-weight:900;","VectorWatch"),
+          div(style="opacity:.7; font-size:.9rem;","Malaria surveillance • hotspots • early signal")
+        ),
+        div(style="margin-left:auto; display:flex; gap:10px; align-items:center;",
+          actionButton("toggle_side","☰", class="vw-ghost", onclick="vwToggleSidebar();"),
+          uiOutput("whoami_ui"),
+          actionButton("logout","Logout", class="vw-ghost")
+        )
+      ),
+      div(class="vw-scrim", onclick="vwCloseSidebar();"),
+      div(class="vw-shell",
+        div(class="vw-sidebar",
+          div(class="vw-card vw-pad",
+            h4("Controls"),
+            textInput("data_dir","Dataset folder", value=rv$data_dir, placeholder="Folder containing high/, medium/, low/"),
+            shinyDirButton("dir","Pick folder on this device","Choose folder"),
+
+            hr(),
+            selectInput("coverage","Coverage", choices=c("high","medium","low"), selected="high"),
+            uiOutput("mode_hint"),
+            uiOutput("time_selector"),
+
+            hr(),
+            sliderInput("min_n","Minimum tests per county", min=100, max=10000, value=500, step=100),
+            selectInput("cluster_filter","Show clusters",
+              choices=c("All","High-High","Low-Low","High-Low","Low-High","Not significant"), selected="All"
+            ),
+
+            hr(),
+            downloadButton("dl_hotspots","Download hotspots (CSV)", class="vw-ghost")
+          )
+        ),
+        div(class="vw-main", uiOutput("app_main"))
+      )
+    )
+  }
+
+  output$page <- renderUI({
+    if(rv$step == "landing") return(landing_ui())
+    if(rv$step == "login") return(login_ui())
+    if(rv$step == "app") return(app_ui())
+    landing_ui()
+  })
+
+  observeEvent(input$go_login, { rv$step <- "login" })
+  observeEvent(input$back_landing, { rv$step <- "landing" })
+  observeEvent(input$learn_more, {
+    showModal(modalDialog(
+      title = "VectorWatch — quick tour",
+      easyClose = TRUE,
+      footer = modalButton("Close"),
+      p("1) Pick dataset folder (with high/, medium/, low/)"),
+      p("2) Auto-detect weekly or monthly"),
+      p("3) Maps + hotspots + trends")
+    ))
+  })
+
+  tries <- reactiveVal(0)
+  output$login_msg <- renderUI(NULL)
 
   observeEvent(input$login_btn, {
     u <- trimws(input$login_user %||% "")
     p <- input$login_pass %||% ""
 
-    if (tries() >= 5) {
-      output$login_msg <- renderUI(div(style="margin-top:.8rem;color:#FFC857;",
-                                      "Too many attempts. Refresh to try again."))
-      return()
-    }
-
     row <- ACCOUNTS |> filter(user == u)
     ok <- nrow(row) == 1 && identical(row$pass_hash[[1]], hash_pw(p))
 
-    if (ok) {
+    if(ok){
       rv$authed <- TRUE
       rv$user <- u
       rv$role <- row$role[[1]]
+
+      # Clear dataset path each login (fixes your "phantom dataset")
+      rv$data_dir <- ""
+      updateTextInput(session, "data_dir", value = "")
+
+      rv$step <- "app"
       tries(0)
       output$login_msg <- renderUI(NULL)
     } else {
       tries(tries() + 1)
-      output$login_msg <- renderUI(div(style="margin-top:.8rem;", span(class="vw-danger", paste0("Login failed (", tries(), "/5)"))))
+      output$login_msg <- renderUI(
+        div(style="margin-top:10px;color:#ff6b6b;font-weight:800;",
+            paste0("Login failed (", tries(), "/5)"))
+      )
     }
+  })
+
+  output$whoami_ui <- renderUI({
+    if(!isTRUE(rv$authed)) return(span(style="opacity:.7;","Not signed in"))
+    span(style="opacity:.9;", paste0("Signed in: ", rv$user, " • ", rv$role))
   })
 
   observeEvent(input$logout, {
     rv$authed <- FALSE
     rv$user <- NULL
     rv$role <- NULL
+    rv$data_dir <- ""
+    rv$step <- "landing"
   })
 
   observeEvent(input$dir, {
     path <- shinyFiles::parseDirPath(volumes, input$dir)
-    if(length(path) && dir.exists(path)) rv$data_dir <- normalizePath(path, winslash="/", mustWork=FALSE)
-  })
-
-  output$sidebar_ui <- renderUI({
-    if (!isTRUE(rv$authed)) return(NULL)
-
-    tagList(
-      div(class="vw-card vw-pad vw-glow vw-appear",
-        tags$h4(style="margin:0 0 .8rem; font-weight:900;", "Controls"),
-        textInput("data_dir", "Dataset location", value = rv$data_dir),
-        shinyDirButton("dir", "Pick folder on this device", "Choose folder"),
-        tags$div(style="margin-top:.5rem; color:rgba(255,255,255,.65); font-size:.92rem;",
-                 "Pick the folder that contains high/, medium/, low/."),
-        tags$hr(style="border-color: rgba(255,255,255,.10);"),
-
-        selectInput("coverage", "Coverage", choices = c("high","medium","low"), selected = "high"),
-        uiOutput("mode_hint"),
-        uiOutput("time_selector"),
-
-        tags$hr(style="border-color: rgba(255,255,255,.10);"),
-        sliderInput("min_n", "Minimum tests per county", min = 100, max = 10000, value = 500, step = 100),
-        selectInput("cluster_filter", "Show clusters", choices = c("All","High-High","Low-Low","High-Low","Low-High","Not significant"), selected = "All"),
-
-        tags$hr(style="border-color: rgba(255,255,255,.10);"),
-        downloadButton("dl_hotspots", "Download hotspots (CSV)", class="vw-ghost")
-      )
-    )
+    if(length(path) && dir.exists(path)){
+      rv$data_dir <- normalizePath(path, winslash="/", mustWork=FALSE)
+      updateTextInput(session, "data_dir", value = rv$data_dir)
+    }
   })
 
   observeEvent(input$data_dir, {
-    rv$data_dir <- input$data_dir
+    rv$data_dir <- input$data_dir %||% ""
   }, ignoreInit = TRUE)
 
-  output$main_ui <- renderUI({
-    if (!isTRUE(rv$authed)) return(login_ui())
+  dataset_status <- reactive({
+    if(!isTRUE(rv$authed)) return(list(ready=FALSE, msg="Not signed in."))
 
-    tabsetPanel(
-      type = "pills",
+    base <- rv$data_dir %||% ""
+    if(identical(base,"")) return(list(ready=FALSE, msg="Pick a dataset folder to begin."))
+    if(!dir.exists(base)) return(list(ready=FALSE, msg="That folder does not exist. Pick again."))
 
-      tabPanel("Command Center",
-        fluidRow(
-          column(3, div(class="vw-card vw-pad vw-glow vw-kpi vw-appear", uiOutput("kpi_tests"))),
-          column(3, div(class="vw-card vw-pad vw-glow vw-kpi vw-appear", uiOutput("kpi_pos"))),
-          column(3, div(class="vw-card vw-pad vw-glow vw-kpi vw-appear", uiOutput("kpi_hotspots"))),
-          column(3, div(class="vw-card vw-pad vw-glow vw-kpi vw-appear", uiOutput("kpi_moran")))
-        ),
-        br(),
-        fluidRow(
-          column(7, div(class="vw-card vw-pad vw-glow vw-appear vw-out", tags$h4("Prevalence map"), leafletOutput("map", height = 440))),
-          column(5, div(class="vw-card vw-pad vw-glow vw-appear", tags$h4("Priority queue"), uiOutput("data_status"), tableOutput("priority_table")))
-        )
-      ),
+    cov <- input$coverage %||% "high"
+    cov_dir <- file.path(base, cov)
+    if(!dir.exists(cov_dir)) return(list(ready=FALSE, msg="Your folder must contain: high/, medium/, low/."))
 
-      tabPanel("Hotzones (LISA)",
-        fluidRow(
-          column(7, div(class="vw-card vw-pad vw-glow vw-appear vw-out", tags$h4("LISA cluster map"), leafletOutput("map_lisa", height = 500))),
-          column(5, div(class="vw-card vw-pad vw-glow vw-appear", tags$h4("Hotspot list"), tableOutput("hotspot_table")))
-        )
-      ),
+    mi <- detect_mode(base, cov)
+    if(mi$mode == "none"){
+      return(list(ready=FALSE, msg=paste0("No VectorWatch CSVs found inside ", cov, "/."), mi=mi))
+    }
 
-      tabPanel("Trends",
-        fluidRow(
-          column(4, div(class="vw-card vw-pad vw-glow vw-appear",
-                        tags$h4("Weekly trend"),
-                        selectInput("trend_county", "County", choices = character(0)))),
-          column(8, div(class="vw-card vw-pad vw-glow vw-appear vw-out",
-                        plotlyOutput("trend_plot", height = 450)))
-        )
-      ),
-
-      tabPanel("3D Insights",
-        div(class="vw-card vw-pad vw-glow vw-appear vw-out",
-          tags$h4("3D county profile"),
-          tags$p(style="margin-top:-.2rem;color:rgba(255,255,255,.65);",
-                 "Rotate/zoom. X = mean age, Y = mean Hb, Z = prevalence (%)."),
-          plotlyOutput("plot3d", height = 560)
-        )
-      )
-    )
-  })
-
-  mode_info <- reactive({
-    req(rv$authed)
-    req(input$coverage)
-    detect_mode(rv$data_dir, input$coverage)
+    list(ready=TRUE, msg="Dataset ready.", mi=mi)
   })
 
   output$mode_hint <- renderUI({
-    mi <- mode_info()
-    div(style="margin-top:.35rem; font-size:.92rem; color:rgba(255,255,255,.70);",
-        paste0("Auto-detect: ", mi$hint))
+    st <- dataset_status()
+    mi <- st$mi %||% list(hint="Pick a folder to begin.")
+    div(style="margin-top:8px; opacity:.8;", paste0("Auto-detect: ", mi$hint))
   })
 
   output$time_selector <- renderUI({
-    mi <- mode_info()
-    if(mi$mode == "weekly"){
-      selectizeInput("time_vals", "ISO weeks (2024)", choices = 1:52,
-                     selected = c(10,11,12,13,14,15), multiple = TRUE,
-                     options = list(plugins = list("remove_button")))
+    st <- dataset_status()
+    if(!isTRUE(st$ready)) return(div(style="opacity:.8;", st$msg))
+
+    if(st$mi$mode == "weekly"){
+      selectizeInput(
+        "time_vals","ISO weeks (2024)",
+        choices=1:52, selected=c(10,11,12,13,14,15),
+        multiple=TRUE,
+        options=list(plugins=list("remove_button"))
+      )
     } else {
-      selectizeInput("time_vals", "Months (2024)", choices = 1:12,
-                     selected = c(3,4,5), multiple = TRUE,
-                     options = list(plugins = list("remove_button")))
+      selectizeInput(
+        "time_vals","Months (2024)",
+        choices=1:12, selected=c(3,4,5),
+        multiple=TRUE,
+        options=list(plugins=list("remove_button"))
+      )
     }
   })
 
   df_raw <- reactive({
-    req(rv$authed)
-    mi <- mode_info()
+    st <- dataset_status()
+    req(isTRUE(st$ready))
     req(input$time_vals)
 
-    validate(need(mi$mode != "none",
-      paste0("No VectorWatch CSVs detected.\n\n",
-             "Folder must contain: high/, medium/, low/\n",
-             "Example weekly: vectorwatch_malaria_2024_W10_high.csv\n",
-             "Example monthly: vectorwatch_malaria_2024_03_high.csv")
-    ))
-
-    df <- read_data(rv$data_dir, input$coverage, mi$mode, as.integer(input$time_vals))
-    validate(need(!is.null(df), "No matching files for your selection. Try different weeks/months or confirm folder."))
+    df <- read_data(rv$data_dir, input$coverage, st$mi$mode, as.integer(input$time_vals))
+    validate(need(!is.null(df), "No matching files for your selection."))
     df
   })
 
   county_summary <- reactive({
-    make_county_summary(df_raw()) |> filter(n_tests >= input$min_n)
+    req(df_raw())
+    make_county_summary(df_raw()) |> filter(n_tests >= (input$min_n %||% 500))
   })
-
-  observeEvent(df_raw(), {
-    d <- df_raw() |> distinct(county) |> arrange(county)
-    updateSelectInput(session, "trend_county", choices = d$county, selected = d$county[1])
-  }, ignoreInit = TRUE)
 
   kenya_joined <- reactive({
     req(rv$kenya_sf)
-    rv$kenya_sf |> left_join(county_summary(), by = "county_key")
+    st <- dataset_status()
+    if(!isTRUE(st$ready)) return(rv$kenya_sf |> mutate(prevalence = NA_real_))
+    rv$kenya_sf |> left_join(county_summary(), by="county_key")
   })
 
   esda <- reactive({
     req(rv$kenya_sf)
+    st <- dataset_status()
+    if(!isTRUE(st$ready)) return(list(ok=FALSE, msg=st$msg, km=rv$kenya_sf))
     esda_on_polygons(kenya_joined())
   })
 
-  output$kpi_tests <- renderUI({
-    div(class="vw-kpi", div(class="k","Records loaded"),
-        div(class="v", format(nrow(df_raw()), big.mark=",")),
-        div(class="sub", paste0("Coverage: ", input$coverage)))
+  output$app_main <- renderUI({
+    st <- dataset_status()
+    if(!isTRUE(st$ready)){
+      return(div(class="vw-card vw-pad",
+        h3("Connect a dataset"),
+        p(style="opacity:.8;", st$msg)
+      ))
+    }
+
+    tabsetPanel(type="pills",
+      tabPanel("Map",      div(class="vw-card vw-pad", leafletOutput("map_prev", height="70vh"))),
+      tabPanel("Hotzones", div(class="vw-card vw-pad", leafletOutput("map_lisa", height="70vh"))),
+      tabPanel("Trends",   div(class="vw-card vw-pad", plotlyOutput("trend_plot", height="70vh"))),
+      tabPanel("3D",       div(class="vw-card vw-pad", plotlyOutput("plot3d", height="70vh")))
+    )
   })
 
-  output$kpi_pos <- renderUI({
-    r <- mean(df_raw()$parasite_detected == 1, na.rm = TRUE)
-    div(class="vw-kpi", div(class="k","Positivity rate"),
-        div(class="v", paste0(round(100*r,1), "%")),
-        div(class="sub", paste0("Selected: ", paste(input$time_vals, collapse=", "))))
-  })
-
-  output$kpi_hotspots <- renderUI({
-    e <- esda()
-    if(!isTRUE(e$ok)) return(div(class="vw-kpi", div(class="k","High–High hotspots"), div(class="v","—"), div(class="sub", e$msg)))
-    hh <- sum(e$km$cluster == "High-High", na.rm = TRUE)
-    div(class="vw-kpi", div(class="k","High–High hotspots"), div(class="v", hh), div(class="sub","p ≤ 0.05"))
-  })
-
-  output$kpi_moran <- renderUI({
-    e <- esda()
-    if(!isTRUE(e$ok)) return(div(class="vw-kpi", div(class="k","Global Moran’s I"), div(class="v","—"), div(class="sub", e$msg)))
-    mor <- e$moran
-    I <- unname(mor$estimate[["Moran I statistic"]])
-    p <- mor$p.value
-    div(class="vw-kpi", div(class="k","Global Moran’s I (p)"), div(class="v", paste0(round(I,3))),
-        div(class="sub", paste0("p=", signif(p,3))))
-  })
-
-  output$data_status <- renderUI({
-    mi <- mode_info()
-    div(style="margin:.5rem 0; padding:.6rem .75rem; border-radius: 16px;
-              border:1px solid rgba(74,242,214,.22); background: rgba(74,242,214,.08);
-              color: rgba(255,255,255,.85);",
-        strong("Using: "), rv$data_dir, br(),
-        span(style="opacity:.85;", paste0("Coverage: ", input$coverage, " • Mode: ", mi$mode, " • Selected: ", paste(input$time_vals, collapse=', '))))
-  })
-
-  output$priority_table <- renderTable({
-    e <- esda()
-    validate(need(isTRUE(e$ok), e$msg))
-    km <- e$km |> st_drop_geometry()
-
-    if (input$cluster_filter != "All") km <- km |> filter(cluster == input$cluster_filter)
-
-    km |>
-      mutate(priority = case_when(
-        cluster == "High-High" ~ 1L,
-        cluster == "High-Low"  ~ 2L,
-        cluster == "Low-High"  ~ 3L,
-        cluster == "Low-Low"   ~ 4L,
-        TRUE                   ~ 9L
-      )) |>
-      arrange(priority, desc(prevalence)) |>
-      transmute(county, cluster, n_tests, prevalence = round(prevalence,2), p = signif(p_Ii,3)) |>
-      head(10)
-  }, striped = TRUE)
-
-  output$hotspot_table <- renderTable({
-    e <- esda()
-    validate(need(isTRUE(e$ok), e$msg))
-    e$km |>
-      st_drop_geometry() |>
-      filter(p_Ii <= 0.05, cluster != "Not significant") |>
-      arrange(factor(cluster, levels=c("High-High","High-Low","Low-High","Low-Low")), desc(prevalence)) |>
-      transmute(county, cluster, n_tests, prevalence = round(prevalence,2), Ii = round(Ii,3), p = signif(p_Ii,3)) |>
-      head(25)
-  }, striped = TRUE)
-
-  output$map <- renderLeaflet({
+  output$map_prev <- renderLeaflet({
     req(rv$kenya_sf)
     km <- kenya_joined()
     pal <- colorNumeric("viridis", domain = km$prevalence, na.color = "transparent")
@@ -627,8 +626,10 @@ server <- function(input, output, session){
       addPolygons(
         color = "rgba(255,255,255,.16)", weight = 1, opacity = 1,
         fillColor = ~pal(prevalence), fillOpacity = 0.78,
-        label = ~paste0("<b>", county, "</b><br/>Tests: ", ifelse(is.na(n_tests),"—",n_tests),
-                        "<br/>Prevalence: ", ifelse(is.na(prevalence),"—",round(prevalence,1)),"%") |> lapply(HTML),
+        label = ~paste0(
+          "<b>", county, "</b><br/>Tests: ", ifelse(is.na(n_tests),"—",n_tests),
+          "<br/>Prevalence: ", ifelse(is.na(prevalence),"—",round(prevalence,1)),"%"
+        ) |> lapply(HTML),
         highlightOptions = highlightOptions(weight = 2, color = "#4AF2D6", fillOpacity = 0.92, bringToFront = TRUE)
       ) |>
       addLegend("bottomright", pal = pal, values = ~prevalence, title = "Prevalence (%)", opacity = 1)
@@ -640,13 +641,19 @@ server <- function(input, output, session){
     validate(need(isTRUE(e$ok), e$msg))
     km <- e$km
 
+    # filter clusters if requested
+    cf <- input$cluster_filter %||% "All"
+    if(cf != "All"){
+      km <- km |> filter(cluster == cf)
+    }
+
     lisa_pal <- colorFactor(
       palette = c(
-        "High-High" = "#FF4D6D",
-        "Low-Low" = "#4AF2D6",
-        "High-Low" = "#FFC857",
-        "Low-High" = "#4C78FF",
-        "Not significant" = "rgba(255,255,255,.08)"
+        "High-High"="#FF4D6D",
+        "Low-Low"="#4AF2D6",
+        "High-Low"="#FFC857",
+        "Low-High"="#4C78FF",
+        "Not significant"="#4AF2D5"
       ),
       domain = c("High-High","Low-Low","High-Low","Low-High","Not significant")
     )
@@ -656,18 +663,19 @@ server <- function(input, output, session){
       addPolygons(
         color = "rgba(255,255,255,.16)", weight = 1, opacity = 1,
         fillColor = ~lisa_pal(cluster), fillOpacity = 0.80,
-        label = ~paste0("<b>", county, "</b><br/>Cluster: ", cluster,
-                        "<br/>Prev: ", round(prevalence,1), "%<br/>p: ", signif(p_Ii,3)) |> lapply(HTML),
+        label = ~paste0(
+          "<b>", county, "</b><br/>Cluster: ", cluster,
+          "<br/>Prev: ", round(prevalence,1), "%<br/>p: ", signif(p_Ii,3)
+        ) |> lapply(HTML),
         highlightOptions = highlightOptions(weight = 2, color = "#4AF2D6", fillOpacity = 0.92, bringToFront = TRUE)
       ) |>
       addLegend("bottomright", pal = lisa_pal, values = ~cluster, title = "LISA cluster", opacity = 1)
   })
 
   output$trend_plot <- renderPlotly({
-    req(input$trend_county)
+    req(df_raw())
 
     wk <- df_raw() |>
-      filter(county == input$trend_county) |>
       group_by(iso_week) |>
       summarise(
         tests = n(),
@@ -677,16 +685,19 @@ server <- function(input, output, session){
       ) |>
       arrange(iso_week)
 
-    plot_ly(wk, x = ~iso_week, y = ~positivity, type = "scatter", mode = "lines+markers",
-            hovertemplate = "Week: %{x}<br>Positivity: %{y:.1f}%<extra></extra>",
-            line = list(width = 3)) |>
+    plot_ly(
+      wk, x = ~iso_week, y = ~positivity,
+      type="scatter", mode="lines+markers",
+      hovertemplate="Week: %{x}<br>Positivity: %{y:.1f}%<extra></extra>",
+      line=list(width=3)
+    ) |>
       layout(
-        paper_bgcolor = "rgba(0,0,0,0)",
-        plot_bgcolor  = "rgba(0,0,0,0)",
-        font = list(color = "rgba(255,255,255,.88)"),
-        xaxis = list(title = "ISO week", gridcolor = "rgba(255,255,255,.08)"),
-        yaxis = list(title = "Positivity (%)", gridcolor = "rgba(255,255,255,.08)"),
-        margin = list(l=55, r=15, b=45, t=15)
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=list(color="rgba(255,255,255,.88)"),
+        xaxis=list(title="ISO week", gridcolor="rgba(255,255,255,.08)"),
+        yaxis=list(title="Positivity (%)", gridcolor="rgba(255,255,255,.08)"),
+        margin=list(l=55,r=15,b=45,t=15)
       )
   })
 
@@ -698,27 +709,30 @@ server <- function(input, output, session){
       st_drop_geometry() |>
       filter(!is.na(mean_age), !is.na(mean_hb), !is.na(prevalence))
 
-    validate(need(nrow(km) > 3, "Not enough counties for 3D plot. Lower the filter or select more weeks/months."))
+    validate(need(nrow(km) > 3, "Not enough counties for 3D plot. Select more time slices or lower minimum tests."))
 
     plot_ly(
-      data = km,
-      x = ~mean_age, y = ~mean_hb, z = ~prevalence,
-      type = "scatter3d", mode = "markers",
-      color = ~cluster,
-      marker = list(size = 4, opacity = 0.9),
-      text = ~paste0("<b>", county, "</b><br>Prev: ", round(prevalence,1), "%<br>Tests: ", n_tests, "<br>Cluster: ", cluster),
-      hoverinfo = "text"
+      km,
+      x=~mean_age, y=~mean_hb, z=~prevalence,
+      type="scatter3d", mode="markers",
+      color=~cluster,
+      marker=list(size=4, opacity=0.92),
+      text=~paste0(
+        "<b>", county, "</b><br>Prev: ", round(prevalence,1), "%<br>",
+        "Tests: ", n_tests, "<br>Cluster: ", cluster
+      ),
+      hoverinfo="text"
     ) |>
       layout(
-        paper_bgcolor = "rgba(0,0,0,0)",
-        font = list(color = "rgba(255,255,255,.88)"),
-        scene = list(
-          bgcolor = "rgba(0,0,0,0)",
-          xaxis = list(title = "Mean age", gridcolor = "rgba(255,255,255,.08)"),
-          yaxis = list(title = "Mean Hb (g/dL)", gridcolor = "rgba(255,255,255,.08)"),
-          zaxis = list(title = "Prevalence (%)", gridcolor = "rgba(255,255,255,.08)")
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=list(color="rgba(255,255,255,.88)"),
+        scene=list(
+          bgcolor="rgba(0,0,0,0)",
+          xaxis=list(title="Mean age", gridcolor="rgba(255,255,255,.08)"),
+          yaxis=list(title="Mean Hb (g/dL)", gridcolor="rgba(255,255,255,.08)"),
+          zaxis=list(title="Prevalence (%)", gridcolor="rgba(255,255,255,.08)")
         ),
-        margin = list(l=0, r=0, b=0, t=0)
+        margin=list(l=0,r=0,b=0,t=0)
       )
   })
 
@@ -727,11 +741,13 @@ server <- function(input, output, session){
     content = function(file){
       e <- esda()
       if(!isTRUE(e$ok)){
-        writeLines("ESDA not available for current selection. Select more weeks/months or lower the filter.", file)
+        writeLines("ESDA not available for current selection.", file)
         return()
       }
-      km <- e$km |> st_drop_geometry()
-      out <- km |> select(county, cluster, n_tests, malaria_cases, prevalence, Ii, p_Ii) |> arrange(desc(prevalence))
+      out <- e$km |>
+        st_drop_geometry() |>
+        select(county, cluster, n_tests, malaria_cases, prevalence, Ii, p_Ii) |>
+        arrange(desc(prevalence))
       write.csv(out, file, row.names = FALSE)
     }
   )
